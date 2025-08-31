@@ -2,8 +2,10 @@ package event
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+
+	"github.com/goccy/go-reflect"
 
 	"github.com/google/uuid"
 )
@@ -153,35 +155,27 @@ func (b *Bus[T]) Publish(ctx context.Context, event Event) error {
 // Метод является потокобезопасным. Он создает уникальную подписку,
 // сохраняет ее и возвращает функцию для отписки.
 func (b *Bus[T]) Subscribe(topic string, handler any, opts ...SubscribeOption[Event]) (unsubscribe func(), err error) {
+	// Создаем обертку с использованием рефлексии.
+	wrappedHandler, err := wrapHandler(handler)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка создания обертки обработчика: %w", err)
+	}
+
 	subOpts := subscriptionOptions[Event]{}
 	for _, opt := range opts {
 		opt(&subOpts)
 	}
 
-	// Ключевое исправление: приводим тип обработчика к EventHandler[Event]
-	// на этапе подписки. Это решает проблему с несоответствием типов
-	// в асинхронных вызовах и устраняет дедлоки в тестах.
-	var typedHandler EventHandler[Event]
-	if h, ok := handler.(EventHandler[Event]); ok {
-		typedHandler = h
-	} else if h, ok := handler.(func(context.Context, Event) error); ok {
-		typedHandler = h
-	} else {
-		// Возвращаем ошибку, если тип обработчика не соответствует
-		// ни одному из ожидаемых. Это делает API более строгим и предсказуемым.
-		return nil, errors.New("некорректный тип обработчика: ожидался EventHandler[Event] или func(context.Context, Event) error")
-	}
-
-	// Применяем middleware к типизированному обработчику.
-	wrappedHandler := typedHandler
+	// Применяем middleware к уже созданной универсальной обертке.
+	finalHandler := wrappedHandler
 	for i := len(subOpts.middleware) - 1; i >= 0; i-- {
-		wrappedHandler = subOpts.middleware[i](wrappedHandler)
+		finalHandler = subOpts.middleware[i](finalHandler)
 	}
 
 	sub := &subscription{
 		id:           uuid.NewString(),
 		topic:        topic,
-		handler:      wrappedHandler, // Сохраняем уже обернутый и типизированный обработчик
+		handler:      finalHandler, // Сохраняем финальный обработчик
 		isAsync:      subOpts.isAsync,
 		errorHandler: subOpts.errorHandler,
 	}
@@ -259,4 +253,70 @@ func (b *Bus[T]) dispatch(ctx context.Context, event Event, sub *subscription) {
 			b.pool.ProcessSync(ctx, event, sub)
 		}
 	}()
+}
+
+// wrapHandler использует рефлексию для создания универсальной обертки
+// вокруг типизированного обработчика.
+// Это позволяет пользователям передавать функции вида `func(ctx, MyEvent)`
+// напрямую в Subscribe, без ручного приведения типов.
+func wrapHandler(handler any) (EventHandler[Event], error) {
+	handlerType := reflect.TypeOf(handler)
+
+	// 1. Проверка, что обработчик является функцией.
+	if handlerType.Kind() != reflect.Func {
+		return nil, fmt.Errorf("обработчик не является функцией, получен тип: %T", handler)
+	}
+
+	// 2. Проверка сигнатуры: количество входных аргументов.
+	if handlerType.NumIn() != 2 {
+		return nil, fmt.Errorf("обработчик должен принимать 2 аргумента (context.Context, Event), а принимает %d", handlerType.NumIn())
+	}
+
+	// 3. Проверка сигнатуры: количество возвращаемых значений.
+	if handlerType.NumOut() != 1 {
+		return nil, fmt.Errorf("обработчик должен возвращать 1 значение (error), а возвращает %d", handlerType.NumOut())
+	}
+
+	// 4. Проверка типов аргументов и возвращаемого значения.
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	eventType := reflect.TypeOf((*Event)(nil)).Elem()
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+
+	if !handlerType.In(0).Implements(ctxType) {
+		return nil, fmt.Errorf("первый аргумент обработчика должен быть context.Context, а не %s", handlerType.In(0))
+	}
+	if !handlerType.In(1).Implements(eventType) {
+		return nil, fmt.Errorf("второй аргумент обработчика должен реализовывать интерфейс Event, а %s - нет", handlerType.In(1))
+	}
+	if !handlerType.Out(0).Implements(errorType) {
+		return nil, fmt.Errorf("возвращаемое значение должно быть типом error, а не %s", handlerType.Out(0))
+	}
+
+	// 5. Создание обертки.
+	handlerValue := reflect.ValueOf(handler)
+	specificEventType := handlerType.In(1)
+
+	wrapper := func(ctx context.Context, e Event) error {
+		// Проверяем, соответствует ли тип пришедшего события
+		// тому, который ожидает обработчик.
+		eventValue := reflect.ValueOf(e)
+		if !eventValue.Type().AssignableTo(specificEventType) {
+			// Тип не совпадает, игнорируем событие.
+			// Это ожидаемое поведение, если на один топик подписаны
+			// обработчики для разных, но связанных типов событий.
+			return nil
+		}
+
+		// Вызываем исходный, типизированный обработчик.
+		args := []reflect.Value{reflect.ValueOf(ctx), eventValue}
+		results := handlerValue.Call(args)
+
+		// Обрабатываем результат.
+		if errResult := results[0].Interface(); errResult != nil {
+			return errResult.(error)
+		}
+		return nil
+	}
+
+	return wrapper, nil
 }

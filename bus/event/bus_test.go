@@ -50,24 +50,20 @@ func TestBus_SubscribeAndPublish_Sync(t *testing.T) {
 	var receivedData2 string
 
 	// Подписчик 1
-	unsubscribe1, err := bus.Subscribe(testTopic, EventHandler[Event](func(ctx context.Context, e Event) error {
+	unsubscribe1, err := bus.Subscribe(testTopic, func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
-		if te, ok := e.(testEvent); ok {
-			receivedData1 = te.data
-		}
+		receivedData1 = e.data
 		return nil
-	}))
+	})
 	require.NoError(t, err)
 	defer unsubscribe1()
 
 	// Подписчик 2
-	unsubscribe2, err := bus.Subscribe(testTopic, EventHandler[Event](func(ctx context.Context, e Event) error {
+	unsubscribe2, err := bus.Subscribe(testTopic, func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
-		if te, ok := e.(testEvent); ok {
-			receivedData2 = te.data
-		}
+		receivedData2 = e.data
 		return nil
-	}))
+	})
 	require.NoError(t, err)
 	defer unsubscribe2()
 
@@ -91,7 +87,7 @@ func TestBus_SubscribeAndPublish_Async(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
-	handler := func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
 		atomic.AddInt32(&counter, 1)
 		time.Sleep(10 * time.Millisecond) // Имитация работы
@@ -118,10 +114,10 @@ func TestBus_Unsubscribe(t *testing.T) {
 
 	var counter int32
 
-	handler := EventHandler[Event](func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		atomic.AddInt32(&counter, 1)
 		return nil
-	})
+	}
 
 	unsubscribe, err := bus.Subscribe(testTopic, handler)
 	require.NoError(t, err)
@@ -170,11 +166,11 @@ func TestBus_Middleware(t *testing.T) {
 		}
 	}
 
-	handler := EventHandler[Event](func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
 		middlewareOrder = append(middlewareOrder, "handler")
 		return nil
-	})
+	}
 
 	// Примечание: текущая реализация Bus.Subscribe не поддерживает middleware.
 	// Этот тест является "заготовкой" на будущее и упадет, пока
@@ -203,7 +199,7 @@ func TestBus_ErrorHandler(t *testing.T) {
 	errWg := &sync.WaitGroup{}
 	errWg.Add(1)
 
-	handler := func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		return errors.New("handler-error")
 	}
 
@@ -243,13 +239,13 @@ func TestBus_PanicRecovery(t *testing.T) {
 	var normalHandlerCalled bool
 
 	// Паникующий обработчик
-	panicHandler := func(ctx context.Context, e Event) error {
+	panicHandler := func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
 		panic("test panic")
 	}
 
 	// Нормальный обработчик
-	normalHandler := func(ctx context.Context, e Event) error {
+	normalHandler := func(ctx context.Context, e testEvent) error {
 		defer wg.Done()
 		normalHandlerCalled = true
 		return nil
@@ -284,7 +280,7 @@ func TestBus_ConcurrentSubscribe(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(subscribersCount)
 
-	handler := func(ctx context.Context, e Event) error { return nil }
+	handler := func(ctx context.Context, e testEvent) error { return nil }
 
 	for i := 0; i < subscribersCount; i++ {
 		go func() {
@@ -317,7 +313,7 @@ func TestBus_ConcurrentPublish(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(publishersCount)
 
-	handler := func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		atomic.AddInt32(&processedCount, 1)
 		wg.Done()
 		return nil
@@ -359,7 +355,7 @@ func TestBus_ConcurrentSubscribeAndPublish(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(publisherGoroutines * eventsPerPublisher)
 
-	handler := func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		atomic.AddInt32(&totalReceived, 1)
 		wg.Done()
 		return nil
@@ -418,7 +414,7 @@ func benchmarkPublish(b *testing.B, numSubscribers int, isAsync bool) {
 	bus := NewBus()
 	defer bus.Shutdown(context.Background())
 
-	handler := func(ctx context.Context, e Event) error {
+	handler := func(ctx context.Context, e testEvent) error {
 		// Пустой обработчик, чтобы измерять только накладные расходы шины.
 		return nil
 	}

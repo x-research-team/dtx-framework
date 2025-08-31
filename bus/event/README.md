@@ -4,7 +4,7 @@
 
 ## Основные возможности
 
-*   **Статическая типизация:** Использование дженериков (Generics) для обеспечения безопасности типов на этапе компиляции.
+*   **Статическая типизация:** Использование дженериков (Generics) и рефлексии для обеспечения безопасности типов на этапе компиляции и во время выполнения. Вы можете передавать строго типизированные обработчики, например `func(ctx, UserCreatedEvent)`, без необходимости ручного приведения типов.
 *   **Потокобезопасность:** Гарантированная безопасность при работе в многопоточной среде.
 *   **Синхронная и асинхронная обработка:** Поддержка как синхронных, так и асинхронных обработчиков событий с помощью внутреннего пула воркеров.
 *   **Промежуточное ПО (Middleware):** Возможность добавления middleware для расширения функциональности обработчиков.
@@ -21,7 +21,7 @@ go get github.com/X-Research-Team/dtx-framework/bus/event
 
 ## Пример использования
 
-Ниже приведен полный пример, демонстрирующий основные возможности шины событий.
+Ниже приведен полный пример, демонстрирующий основные возможности шины событий, включая использование строго типизированных обработчиков.
 
 ```go
 package main
@@ -61,52 +61,51 @@ func (e OrderPlacedEvent) Topic() string {
 // 2. Создание и настройка шины
 
 func main() {
-	// Создаем новую шину событий
+	// Создаем новую шину событий.
+	// NewBus возвращает *Bus[event.Event], что позволяет публиковать
+	// и подписываться на любой тип, реализующий интерфейс event.Event.
 	bus := event.NewBus()
 	defer bus.Shutdown(context.Background())
 
-	// 3. Создание обработчиков
+	// 3. Создание строго типизированных обработчиков
 
-	// Синхронный обработчик для UserCreatedEvent
-	userCreatedHandler := func(ctx context.Context, e event.Event) error {
-		if ev, ok := e.(UserCreatedEvent); ok {
-			fmt.Printf("[Синхронный обработчик] Пользователь создан: ID=%s, Email=%s\n", ev.UserID, ev.Email)
-		}
+	// Синхронный обработчик для UserCreatedEvent.
+	// Обратите внимание: тип второго аргумента - UserCreatedEvent, а не event.Event.
+	// Ручное приведение типов больше не требуется.
+	userCreatedHandler := func(ctx context.Context, ev UserCreatedEvent) error {
+		fmt.Printf("[Синхронный обработчик] Пользователь создан: ID=%s, Email=%s\n", ev.UserID, ev.Email)
 		return nil
 	}
 
-	// Асинхронный обработчик для OrderPlacedEvent
-	orderPlacedHandler := func(ctx context.Context, e event.Event) error {
-		if ev, ok := e.(OrderPlacedEvent); ok {
-			fmt.Printf("[Асинхронный обработчик] Заказ размещен: ID=%s, Сумма=%.2f\n", ev.OrderID, ev.Amount)
-			time.Sleep(100 * time.Millisecond) // Имитация долгой работы
-		}
+	// Асинхронный обработчик для OrderPlacedEvent.
+	orderPlacedHandler := func(ctx context.Context, ev OrderPlacedEvent) error {
+		fmt.Printf("[Асинхронный обработчик] Заказ размещен: ID=%s, Сумма=%.2f\n", ev.OrderID, ev.Amount)
+		time.Sleep(100 * time.Millisecond) // Имитация долгой работы
 		return nil
 	}
 
-	// Обработчик ошибок
-	errorHandler := func(err error, e event.Event) {
-		log.Printf("Ошибка при обработке события %T: %v", e, err)
+	// Обработчик ошибок для конкретного типа события.
+	orderErrorHandler := func(err error, e OrderPlacedEvent) {
+		log.Printf("Ошибка при обработке OrderPlacedEvent %v: %v", e, err)
 	}
 
 	// 4. Подписка на события
 
-	// Подписываем синхронный обработчик
-	unsubscribeUser, err := bus.Subscribe(
-		UserCreatedEvent{}.Topic(),
-		userCreatedHandler,
-	)
+	// Подписываем синхронный обработчик.
+	// Тип обработчика `func(context.Context, UserCreatedEvent) error` корректно распознается.
+	unsubscribeUser, err := bus.Subscribe(UserCreatedEvent{}.Topic(), userCreatedHandler)
 	if err != nil {
 		log.Fatalf("Не удалось подписаться на событие 'user.created': %v", err)
 	}
 	defer unsubscribeUser()
 
-	// Подписываем асинхронный обработчик с обработчиком ошибок
+	// Подписываем асинхронный обработчик с обработчиком ошибок.
+	// Опции WithAsync и WithErrorHandler также являются типобезопасными.
 	unsubscribeOrder, err := bus.Subscribe(
 		OrderPlacedEvent{}.Topic(),
 		orderPlacedHandler,
-		event.WithAsync[event.Event](),
-		event.WithErrorHandler[event.Event](errorHandler),
+		event.WithAsync[OrderPlacedEvent](),
+		event.WithErrorHandler[OrderPlacedEvent](orderErrorHandler),
 	)
 	if err != nil {
 		log.Fatalf("Не удалось подписаться на событие 'order.placed': %v", err)
@@ -139,7 +138,7 @@ func main() {
 	fmt.Println("Все события опубликованы.")
 
 	// 6. Корректное завершение работы
-	// defer bus.Shutdown() гарантирует, что все асинхронные обработчики завершат свою работу
+	// defer bus.Shutdown() гарантирует, что все асинхронные обработчики завершат свою работу.
 	fmt.Println("Завершение работы...")
 }
 ```
@@ -158,22 +157,21 @@ type Event interface {
 
 ### `event.EventHandler[T]`
 
-Тип для функции-обработчика событий.
+Тип для функции-обработчика событий. `T` должен быть конкретным типом, реализующим `event.Event`.
 
 ```go
 type EventHandler[T Event] func(ctx context.Context, event T) error
 ```
 
-### `event.EventBus[T]`
+### `event.EventBus`
 
-Основной интерфейс шины событий.
+Основной интерфейс шины событий. Реализация `*Bus[T]` является обобщенной, но для удобства использования `NewBus` возвращает `*Bus[Event]`, что позволяет работать с любыми событиями.
 
 ```go
-type EventBus[T Event] interface {
-    Publish(ctx context.Context, event T) error
-    Subscribe(topic string, handler EventHandler[T], opts ...SubscribeOption[T]) (unsubscribe func(), err error)
-    Shutdown(ctx context.Context) error
-}
+// Полный интерфейс не приводится для краткости. Ключевые методы:
+Publish(ctx context.Context, event Event) error
+Subscribe(topic string, handler any, opts ...SubscribeOption[Event]) (unsubscribe func(), err error)
+Shutdown(ctx context.Context) error
 ```
 
 ### `event.NewBus(...)`
@@ -184,13 +182,17 @@ type EventBus[T Event] interface {
 func NewBus(opts ...BusOption) *Bus[Event]
 ```
 
+### `Subscribe`
+
+Метод `Subscribe` принимает `any` в качестве обработчика, но использует рефлексию для обеспечения типобезопасности во время выполнения. Вы можете передавать функции вида `func(ctx, YourEventType) error`, и шина автоматически создаст обертку.
+
 ### Опции
 
 *   **Для шины (`BusOption`):**
     *   `WithLogger(Logger)`: Устанавливает пользовательский логгер.
     *   `WithMetrics(Metrics)`: Устанавливает пользовательский сборщик метрик.
     *   `WithWorkerPoolConfig(min, max, queueSize)`: Настраивает пул воркеров.
-*   **Для подписки (`SubscribeOption`):**
-    *   `WithAsync[T]()`: Включает асинхронную обработку.
-    *   `WithErrorHandler[T](ErrorHandler[T])`: Задает обработчик ошибок.
-    *   `WithMiddleware[T](...Middleware[T])`: Добавляет middleware.
+*   **Для подписки (`SubscribeOption[T]`):**
+    *   `WithAsync[T]()`: Включает асинхронную обработку. `T` должен соответствовать типу события в обработчике.
+    *   `WithErrorHandler[T](ErrorHandler[T])`: Задает обработчик ошибок. `T` должен соответствовать типу события.
+    *   `WithMiddleware[T](...Middleware[T])`: Добавляет middleware. `T` должен соответствовать типу события.
