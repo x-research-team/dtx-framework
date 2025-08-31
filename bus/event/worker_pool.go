@@ -5,14 +5,6 @@ import (
 	"sync"
 )
 
-// task представляет собой задачу для асинхронной обработки в пуле воркеров.
-// Она инкапсулирует все необходимые данные для вызова обработчика события.
-type task struct {
-	ctx          context.Context
-	event        Event
-	subscription *subscription
-}
-
 // workerPool управляет пулом горутин для асинхронной обработки событий.
 // Он обеспечивает ограничение на количество одновременно выполняющихся задач
 // и корректное завершение работы (graceful shutdown).
@@ -27,7 +19,7 @@ type workerPool struct {
 	// tasks — это буферизированный канал, через который воркеры получают
 	// задачи для выполнения. Размер канала определяет, сколько задач
 	// может ожидать в очереди.
-	tasks chan task
+	tasks chan *task
 	// wg — это WaitGroup для синхронизации и ожидания завершения всех
 	// горутин-воркеров при остановке пула.
 	wg sync.WaitGroup
@@ -47,7 +39,7 @@ func newWorkerPool(min, max, queueSize int, logger Logger) *workerPool {
 	return &workerPool{
 		minWorkers: min,
 		maxWorkers: max,
-		tasks:      make(chan task, queueSize),
+		tasks:      make(chan *task, queueSize),
 		logger:     logger,
 	}
 }
@@ -87,20 +79,40 @@ func (p *workerPool) stop() {
 	p.wg.Wait()
 }
 
-// submit безопасно отправляет задачу в пул.
+// submit безопасно отправляет задачу в пул для асинхронной обработки.
 // Возвращает false, если пул уже остановлен и не может принять задачу.
-func (p *workerPool) submit(t task) (ok bool) {
+func (p *workerPool) submit(ctx context.Context, event Event, sub *subscription) (ok bool) {
+	t := taskPool.Get().(*task)
+	t.ctx = ctx
+	t.event = event
+	t.subscription = sub
+
 	defer func() {
 		if r := recover(); r != nil {
 			// Паника может произойти, если канал tasks уже закрыт.
 			// Это ожидаемое поведение при остановке.
 			p.logger.Warnf("Не удалось отправить задачу в пул: %v", r)
 			ok = false
+			// Возвращаем задачу в пул, так как она не была обработана.
+			t.reset()
+			taskPool.Put(t)
 		}
 	}()
 
 	p.tasks <- t
 	return true
+}
+
+// ProcessSync выполняет задачу синхронно, используя тот же механизм обработки,
+// что и воркеры, но без отправки в канал.
+// Это позволяет переиспользовать логику обработки и восстановления после паник.
+func (p *workerPool) ProcessSync(ctx context.Context, event Event, sub *subscription) {
+	t := taskPool.Get().(*task)
+	t.ctx = ctx
+	t.event = event
+	t.subscription = sub
+
+	p.processTask(t)
 }
 
 // worker — это основная функция, выполняемая каждой горутиной в пуле.
@@ -124,7 +136,9 @@ func (p *workerPool) worker(ctx context.Context) {
 // processTask выполняет одну задачу.
 // Важно, что здесь реализован механизм recover для перехвата паник
 // внутри обработчика событий, чтобы одна паника не обрушила весь воркер.
-func (p *workerPool) processTask(t task) {
+// После выполнения задача очищается и возвращается в пул.
+func (p *workerPool) processTask(t *task) {
+	// Гарантируем, что задача будет очищена и возвращена в пул после выполнения.
 	defer func() {
 		if r := recover(); r != nil {
 			p.logger.Errorf(
@@ -134,6 +148,8 @@ func (p *workerPool) processTask(t task) {
 				r,
 			)
 		}
+		t.reset()
+		taskPool.Put(t)
 	}()
 
 	// Здесь будет вызвана обертка, которая выполнит приведение типа
@@ -145,7 +161,6 @@ func (p *workerPool) processTask(t task) {
 	}
 
 	if err := handler(t.ctx, t.event); err != nil {
-		// Если у подписки есть свой обработчик ошибок, используем его.
 		// Если у подписки есть свой обработчик ошибок, используем его.
 		// Приведение типа к ErrorHandler[Event] обеспечивает типобезопасность.
 		if t.subscription.errorHandler != nil {

@@ -21,6 +21,11 @@ type Bus[T Event] struct {
 	// производительность для сценариев с частыми чтениями (Publish)
 	// и редкими записями (Subscribe/Unsubscribe).
 	mu sync.RWMutex
+	// cache — это высокопроизводительный, потокобезопасный кеш для срезов
+	// подписчиков. Он использует `sync.Map` для минимизации блокировок
+	// на горячем пути (Publish). Ключ — топик, значение — `[]*subscription`.
+	// Кеш инвалидируется при каждом изменении подписок (Subscribe/Unsubscribe).
+	cache sync.Map
 	// opts хранит конфигурационные параметры шины,
 	// установленные при ее создании.
 	opts busOptions
@@ -35,6 +40,9 @@ type Bus[T Event] struct {
 	// Это предотвращает состояние гонки, когда Shutdown может начаться
 	// до того, как все события будут отправлены в пул.
 	dispatchWg sync.WaitGroup
+	// slicePool — это пул для переиспользования срезов подписчиков,
+	// чтобы избежать аллокаций на горячем пути в методе Publish.
+	slicePool sync.Pool
 }
 
 // subscription представляет собой внутреннюю структуру для хранения информации
@@ -83,11 +91,18 @@ func NewBus(opts ...BusOption) *Bus[Event] {
 	pool := newWorkerPool(options.workerMin, options.workerMax, options.queueSize, options.logger)
 	pool.start()
 
-	return &Bus[Event]{
+	b := &Bus[Event]{
 		subscribers: make(map[string][]*subscription),
 		opts:        options,
 		pool:        pool,
 	}
+	b.slicePool.New = func() any {
+		// Создаем срез с capacity, чтобы избежать лишних аллокаций при append.
+		// Начальный размер 0, но с запасом.
+		s := make([]*subscription, 0, 10)
+		return &s
+	}
+	return b
 }
 
 // Publish публикует событие в шину.
@@ -96,19 +111,39 @@ func NewBus(opts ...BusOption) *Bus[Event] {
 // Используется RLock для обеспечения высокой производительности при частых чтениях.
 func (b *Bus[T]) Publish(ctx context.Context, event Event) error {
 	topic := event.Topic()
+	var subsToProcess []*subscription
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	if subs, ok := b.subscribers[topic]; ok {
-		// Копируем слайс, чтобы избежать удержания блокировки на время диспетчеризации.
-		// Это критически важная оптимизация для производительности.
-		subscribersToCall := make([]*subscription, len(subs))
-		copy(subscribersToCall, subs)
-
-		for _, sub := range subscribersToCall {
-			b.dispatch(ctx, event, sub)
+	// Этап 1: Попытка чтения из кеша (горячий путь, без блокировок).
+	if cachedSubs, ok := b.cache.Load(topic); ok {
+		// Если в кеше есть запись, используем ее.
+		// Приведение типа необходимо, так как sync.Map хранит any.
+		subsToProcess = cachedSubs.([]*subscription)
+	} else {
+		// Этап 2: Кеш-промах. Переходим к медленному пути с блокировкой.
+		b.mu.RLock()
+		// Получаем срез из пула для создания копии.
+		subsSlicePtr := b.slicePool.Get().(*[]*subscription)
+		// Копируем подписчиков, чтобы избежать гонки данных после разблокировки.
+		if subs, ok := b.subscribers[topic]; ok {
+			*subsSlicePtr = append(*subsSlicePtr, subs...)
 		}
+		b.mu.RUnlock()
+
+		// Сохраняем копию в кеш для будущих вызовов.
+		// Это атомарная операция, которая не блокирует другие чтения.
+		subsToProcess = *subsSlicePtr
+		b.cache.Store(topic, subsToProcess)
+
+		// Важно: не возвращаем срез в пул, так как он теперь хранится в кеше.
+		// Вместо этого, при инвалидации кеша, мы должны будем вернуть его.
+		// (Эта логика будет добавлена в Subscribe/Unsubscribe).
+		// На данном этапе для простоты мы просто не возвращаем его.
+		// TODO: Реализовать возврат среза в пул при инвалидации кеша.
+	}
+
+	// Диспетчеризация событий для подписчиков.
+	for _, sub := range subsToProcess {
+		b.dispatch(ctx, event, sub)
 	}
 
 	return nil
@@ -155,6 +190,8 @@ func (b *Bus[T]) Subscribe(topic string, handler any, opts ...SubscribeOption[Ev
 	defer b.mu.Unlock()
 
 	b.subscribers[topic] = append(b.subscribers[topic], sub)
+	// Инвалидируем кеш для данного топика, так как список подписчиков изменился.
+	b.cache.Delete(topic)
 
 	return func() {
 		b.mu.Lock()
@@ -164,6 +201,8 @@ func (b *Bus[T]) Subscribe(topic string, handler any, opts ...SubscribeOption[Ev
 		for i, s := range subs {
 			if s.id == sub.id {
 				b.subscribers[topic] = append(subs[:i], subs[i+1:]...)
+				// Инвалидируем кеш после отписки.
+				b.cache.Delete(topic)
 				break
 			}
 		}
@@ -212,16 +251,12 @@ func (b *Bus[T]) dispatch(ctx context.Context, event Event, sub *subscription) {
 			// чтобы в Shutdown можно было дождаться их завершения перед остановкой пула.
 			b.dispatchWg.Add(1)
 			defer b.dispatchWg.Done()
-			if ok := b.pool.submit(task{ctx: ctx, event: event, subscription: sub}); !ok {
+			if ok := b.pool.submit(ctx, event, sub); !ok {
 				b.opts.logger.Warnf("Не удалось отправить асинхронную задачу в пул: топик %s", sub.topic)
 			}
 		} else {
 			// Для синхронных подписчиков задача выполняется немедленно в текущей горутине.
-			b.pool.processTask(task{
-				ctx:          ctx,
-				event:        event,
-				subscription: sub,
-			})
+			b.pool.ProcessSync(ctx, event, sub)
 		}
 	}()
 }
