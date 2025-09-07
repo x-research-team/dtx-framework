@@ -24,7 +24,7 @@ func NewRegistry() *Registry {
 // Bus возвращает строго типизированный экземпляр шины для указанного топика.
 // Эта функция является идиоматичным способом работы с реестром в Go,
 // обходя ограничение на отсутствие обобщенных методов.
-func Bus[T Event](r *Registry, topic string) (IBus[T], error) {
+func Bus[T Event](r *Registry, topic string, opts ...BusOption[T]) (IBus[T], error) {
 	r.mu.RLock()
 	bus, exists := r.buses[topic]
 	r.mu.RUnlock()
@@ -47,12 +47,24 @@ func Bus[T Event](r *Registry, topic string) (IBus[T], error) {
 		return nil, fmt.Errorf("шина для топика '%s' уже существует с другим типом события", topic)
 	}
 
-	provider, err := NewLocalProvider[T](topic)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось создать локального провайдера для топика '%s': %w", topic, err)
+	busCfg := busOptions[T]{}
+	for _, opt := range opts {
+		opt(&busCfg)
 	}
 
-	newBus, err := NewBus[T](topic, provider)
+	var provider Provider[T]
+	var err error
+
+	if busCfg.provider != nil {
+		provider = busCfg.provider
+	} else {
+		provider, err = NewLocalProvider[T](topic)
+		if err != nil {
+			return nil, fmt.Errorf("не удалось создать локального провайдера для топика '%s': %w", topic, err)
+		}
+	}
+
+	newBus, err := NewBus(topic, provider, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось создать шину для топика '%s': %w", topic, err)
 	}

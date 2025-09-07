@@ -66,8 +66,19 @@ func (b *busImpl[T]) Shutdown(ctx context.Context) error {
 
 // busOptions содержит конфигурацию для шины.
 type busOptions[T Event] struct {
-	// Здесь могут быть опции, специфичные для шины, например, метрики или логгер.
+	// provider - это кастомная реализация провайдера для шины.
+	// Если не указан, будет использоваться провайдер по умолчанию.
+	provider Provider[T]
 }
 
 // BusOption - это функция для настройки Bus.
 type BusOption[T Event] func(*busOptions[T])
+
+// WithProvider - это опция для установки кастомного провайдера событий.
+// Позволяет заменить стандартную реализацию (например, LocalProvider)
+// на любую другую, совместимую с интерфейсом Provider.
+func WithProvider[T Event](p Provider[T]) BusOption[T] {
+	return func(o *busOptions[T]) {
+		o.provider = p
+	}
+}

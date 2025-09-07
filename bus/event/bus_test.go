@@ -282,6 +282,79 @@ func benchmarkPublish[T Event](b *testing.B, topic string, numSubscribers int, a
 	}
 }
 
+func TestBus_WithProvider(t *testing.T) {
+	t.Parallel()
+
+	registry := NewRegistry()
+	topic := "test.with.provider"
+
+	// 1. Создаем mock-провайдер
+	mockProvider := &mockProvider[UserCreatedEvent]{
+		publishFunc: func(ctx context.Context, event UserCreatedEvent) error {
+			// Проверяем, что событие дошло до нашего мока
+			assert.Equal(t, "user-provider-123", event.UserID)
+			return nil
+		},
+		subscribeFunc: func(handler EventHandler[UserCreatedEvent], opts ...SubscribeOption[UserCreatedEvent]) (unsubscribe func(), err error) {
+			// Для этого теста нам не нужно реализовывать подписку в моке
+			return func() {}, nil
+		},
+	}
+
+	// 2. Получаем шину с опцией WithProvider
+	bus, err := Bus[UserCreatedEvent](registry, topic, WithProvider[UserCreatedEvent](mockProvider))
+	require.NoError(t, err)
+	require.NotNil(t, bus)
+
+	// 3. Публикуем событие
+	event := UserCreatedEvent{UserID: "user-provider-123", Email: "provider@test.com"}
+	err = bus.Publish(context.Background(), event)
+	require.NoError(t, err)
+
+	// 4. Проверяем, что метод Publish был вызван у мока
+	assert.True(t, mockProvider.publishCalled, "метод Publish у mock-провайдера должен быть вызван")
+}
+
+// --- Mock Provider ---
+
+// mockProvider - это mock-реализация интерфейса Provider для тестирования.
+type mockProvider[T Event] struct {
+	publishFunc     func(ctx context.Context, event T) error
+	subscribeFunc   any
+	shutdownFunc    func(ctx context.Context) error
+	publishCalled   bool
+	subscribeCalled bool
+	shutdownCalled  bool
+}
+
+func (m *mockProvider[T]) Publish(ctx context.Context, event T) error {
+	m.publishCalled = true
+	if m.publishFunc != nil {
+		return m.publishFunc(ctx, event)
+	}
+	return nil
+}
+
+func (m *mockProvider[T]) Subscribe(handler EventHandler[T], opts ...SubscribeOption[T]) (unsubscribe func(), err error) {
+	m.subscribeCalled = true
+	if m.subscribeFunc != nil {
+		// Используем приведение типа к конкретной функции, сохраненной в `any`.
+		// Это правильный способ работы с обобщенными типами в моках.
+		if fn, ok := m.subscribeFunc.(func(EventHandler[T], ...SubscribeOption[T]) (func(), error)); ok {
+			return fn(handler, opts...)
+		}
+	}
+	return func() {}, nil
+}
+
+func (m *mockProvider[T]) Shutdown(ctx context.Context) error {
+	m.shutdownCalled = true
+	if m.shutdownFunc != nil {
+		return m.shutdownFunc(ctx)
+	}
+	return nil
+}
+
 func BenchmarkPublish_Sync_OneSubscriber(b *testing.B) {
 	benchmarkPublish[UserCreatedEvent](b, "bench.sync.one", 1, false)
 }
