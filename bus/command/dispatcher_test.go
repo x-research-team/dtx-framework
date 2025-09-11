@@ -153,3 +153,84 @@ func TestRegistry_GetDispatcher_Concurrency(t *testing.T) {
 		assert.Same(t, firstDispatcher, dispatchers[i], "Все горутины должны получать один и тот же экземпляр диспетчера")
 	}
 }
+
+// Тест для проверки корректной работы middleware с использованием функциональных опций.
+func TestDispatcher_WithMiddleware(t *testing.T) {
+	t.Parallel()
+
+	// 1. Настройка
+	executionOrder := make([]string, 0)
+	var mu sync.Mutex
+
+	// Middleware 1: Логирование начала и конца.
+	m1 := func(next command.CommandHandler[testCommand, string]) command.CommandHandler[testCommand, string] {
+		return func(ctx context.Context, cmd testCommand) (string, error) {
+			mu.Lock()
+			executionOrder = append(executionOrder, "m1-start")
+			mu.Unlock()
+
+			res, err := next(ctx, cmd)
+
+			mu.Lock()
+			executionOrder = append(executionOrder, "m1-end")
+			mu.Unlock()
+			return "m1-res-" + res, err
+		}
+	}
+
+	// Middleware 2: Добавление значения в контекст.
+	type key string
+	const contextKey key = "middleware-key"
+	m2 := func(next command.CommandHandler[testCommand, string]) command.CommandHandler[testCommand, string] {
+		return func(ctx context.Context, cmd testCommand) (string, error) {
+			mu.Lock()
+			executionOrder = append(executionOrder, "m2-start")
+			mu.Unlock()
+
+			ctx = context.WithValue(ctx, contextKey, "m2-value")
+			res, err := next(ctx, cmd)
+
+			mu.Lock()
+			executionOrder = append(executionOrder, "m2-end")
+			mu.Unlock()
+			return "m2-res-" + res, err
+		}
+	}
+
+	// Создаем диспетчер с middleware
+	dispatcher := command.NewDispatcher[testCommand, string](
+		command.WithMiddleware(m1),
+		command.WithMiddleware(m2),
+	)
+
+	// Основной обработчик, который проверяет значение из контекста
+	handler := func(ctx context.Context, cmd testCommand) (string, error) {
+		mu.Lock()
+		executionOrder = append(executionOrder, "handler")
+		mu.Unlock()
+
+		val, ok := ctx.Value(contextKey).(string)
+		if !ok || val != "m2-value" {
+			return "", fmt.Errorf("значение из контекста не найдено или некорректно")
+		}
+		return "processed: " + cmd.Value, nil
+	}
+
+	// 2. Регистрация
+	err := dispatcher.Register(handler)
+	require.NoError(t, err)
+
+	// 3. Выполнение
+	cmd := testCommand{Value: "test"}
+	result, err := dispatcher.Dispatch(context.Background(), cmd)
+
+	// 4. Проверка
+	require.NoError(t, err)
+
+	// Проверяем результат: middlewares оборачивают результат в обратном порядке
+	assert.Equal(t, "m1-res-m2-res-processed: test", result)
+
+	// Проверяем порядок выполнения: m1 -> m2 -> handler -> m2 -> m1
+	expectedOrder := []string{"m1-start", "m2-start", "handler", "m2-end", "m1-end"}
+	assert.Equal(t, expectedOrder, executionOrder)
+}

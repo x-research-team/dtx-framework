@@ -26,7 +26,7 @@ func NewRegistry() *Registry {
 // В противном случае будет создан, сохранен в реестре и возвращен новый экземпляр.
 // Функция обеспечивает потокобезопасность и предотвращает состояние гонки
 // при создании нескольких диспетчеров для одного и того же запроса.
-func Dispatcher[Q Query[R], R any](r *Registry, queryName string) (IDispatcher[Q, R], error) {
+func Dispatcher[Q Query[R], R any](r *Registry, queryName string, opts ...Option[Q, R]) (IDispatcher[Q, R], error) {
 	r.mu.RLock()
 	dispatcher, exists := r.dispatchers[queryName]
 	r.mu.RUnlock()
@@ -49,7 +49,7 @@ func Dispatcher[Q Query[R], R any](r *Registry, queryName string) (IDispatcher[Q
 		return nil, fmt.Errorf("диспетчер для запроса '%s' уже существует с другим типом", queryName)
 	}
 
-	newDispatcher := NewDispatcher[Q, R]()
+	newDispatcher := NewDispatcher(opts...)
 	r.dispatchers[queryName] = newDispatcher
 
 	return newDispatcher, nil

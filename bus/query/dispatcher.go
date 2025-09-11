@@ -27,13 +27,25 @@ type IDispatcher[Q Query[R], R any] interface {
 // Он использует reflect.Type для сопоставления запросов с их обработчиками,
 // скрывая сложность дженериков за строго типизированным API.
 type dispatcher[Q Query[R], R any] struct {
-	handler QueryHandler[Q, R]
-	mu      sync.RWMutex
+	handler     QueryHandler[Q, R]
+	middlewares []Middleware[Q, R]
+	mu          sync.RWMutex
 }
 
 // NewDispatcher создает новый, готовый к использованию экземпляр диспетчера.
-func NewDispatcher[Q Query[R], R any]() IDispatcher[Q, R] {
-	return &dispatcher[Q, R]{}
+// Он принимает функциональные опции для конфигурации, например, для добавления middleware.
+func NewDispatcher[Q Query[R], R any](opts ...Option[Q, R]) IDispatcher[Q, R] {
+	cfg := &config[Q, R]{
+		middlewares: make([]Middleware[Q, R], 0),
+	}
+
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	return &dispatcher[Q, R]{
+		middlewares: cfg.middlewares,
+	}
 }
 
 // Register регистрирует обработчик для конкретного типа запроса.
@@ -49,7 +61,14 @@ func (d *dispatcher[Q, R]) Register(handler QueryHandler[Q, R]) error {
 		return fmt.Errorf("обработчик для запроса '%s' уже зарегистрирован", qType)
 	}
 
-	d.handler = handler
+	// Оборачиваем базовый обработчик во все зарегистрированные middlewares.
+	// Middlewares применяются в обратном порядке, чтобы обеспечить выполнение FIFO.
+	h := handler
+	for i := len(d.middlewares) - 1; i >= 0; i-- {
+		h = d.middlewares[i](h)
+	}
+	d.handler = h
+
 	return nil
 }
 

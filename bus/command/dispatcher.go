@@ -27,13 +27,25 @@ type IDispatcher[C Command[R], R any] interface {
 // Он использует reflect.Type для сопоставления команд с их обработчиками,
 // скрывая сложность дженериков за строго типизированным API.
 type dispatcher[C Command[R], R any] struct {
-	handler CommandHandler[C, R]
-	mu      sync.RWMutex
+	handler     CommandHandler[C, R]
+	middlewares []Middleware[C, R]
+	mu          sync.RWMutex
 }
 
 // NewDispatcher создает новый, готовый к использованию экземпляр диспетчера.
-func NewDispatcher[C Command[R], R any]() IDispatcher[C, R] {
-	return &dispatcher[C, R]{}
+// Он принимает функциональные опции для конфигурации, например, для добавления middleware.
+func NewDispatcher[C Command[R], R any](opts ...Option[C, R]) IDispatcher[C, R] {
+	cfg := &config[C, R]{
+		middlewares: make([]Middleware[C, R], 0),
+	}
+
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	return &dispatcher[C, R]{
+		middlewares: cfg.middlewares,
+	}
 }
 
 // Register регистрирует обработчик для конкретного типа команды.
@@ -49,7 +61,14 @@ func (d *dispatcher[C, R]) Register(handler CommandHandler[C, R]) error {
 		return fmt.Errorf("обработчик для команды '%s' уже зарегистрирован", cmdType)
 	}
 
-	d.handler = handler
+	// Оборачиваем базовый обработчик во все зарегистрированные middlewares.
+	// Middlewares применяются в обратном порядке, чтобы обеспечить выполнение FIFO.
+	h := handler
+	for i := len(d.middlewares) - 1; i >= 0; i-- {
+		h = d.middlewares[i](h)
+	}
+	d.handler = h
+
 	return nil
 }
 

@@ -26,7 +26,7 @@ func NewRegistry() *Registry {
 // В противном случае будет создан, сохранен в реестре и возвращен новый экземпляр.
 // Функция обеспечивает потокобезопасность и предотвращает состояние гонки
 // при создании нескольких диспетчеров для одной и той же команды.
-func Dispatcher[C Command[R], R any](r *Registry, commandName string) (IDispatcher[C, R], error) {
+func Dispatcher[C Command[R], R any](r *Registry, commandName string, opts ...Option[C, R]) (IDispatcher[C, R], error) {
 	r.mu.RLock()
 	dispatcher, exists := r.dispatchers[commandName]
 	r.mu.RUnlock()
@@ -49,7 +49,7 @@ func Dispatcher[C Command[R], R any](r *Registry, commandName string) (IDispatch
 		return nil, fmt.Errorf("диспетчер для команды '%s' уже существует с другим типом", commandName)
 	}
 
-	newDispatcher := NewDispatcher[C, R]()
+	newDispatcher := NewDispatcher(opts...)
 	r.dispatchers[commandName] = newDispatcher
 
 	return newDispatcher, nil
