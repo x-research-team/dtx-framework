@@ -1,7 +1,6 @@
 package event
 
 import (
-	"context"
 	"sync"
 )
 
@@ -53,7 +52,7 @@ func (p *workerPool[T]) worker() {
 				return
 			}
 			// В реальном приложении здесь должна быть обработка ошибок из handler.
-			_ = task.handler(context.Background(), task.event)
+			_ = task.handler(task.ctx, task.event)
 		case <-p.stopCh:
 			return
 		}

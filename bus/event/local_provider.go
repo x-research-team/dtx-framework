@@ -31,10 +31,11 @@ type LocalProvider[T Event] struct {
 	subscriptions map[string]*subscription[T]
 	topic         string
 	pool          *workerPool[T]
+	cfg           *config[T]
 }
 
 // NewLocalProvider создает новый экземпляр локального провайдера.
-func NewLocalProvider[T Event](topic string) (*LocalProvider[T], error) {
+func NewLocalProvider[T Event](topic string, cfg *config[T]) (*LocalProvider[T], error) {
 	// В реальном приложении конфигурация пула воркеров должна быть настраиваемой.
 	pool := newWorkerPool[T](1, 10, 100)
 	pool.run()
@@ -43,6 +44,7 @@ func NewLocalProvider[T Event](topic string) (*LocalProvider[T], error) {
 		subscriptions: make(map[string]*subscription[T]),
 		topic:         topic,
 		pool:          pool,
+		cfg:           cfg,
 	}, nil
 }
 
@@ -53,6 +55,7 @@ func (p *LocalProvider[T]) Publish(ctx context.Context, event T) error {
 
 	for _, sub := range p.subscriptions {
 		task := &Task[T]{
+			ctx:     ctx,
 			event:   event,
 			handler: sub.handler,
 		}

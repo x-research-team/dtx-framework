@@ -1,14 +1,23 @@
 package event
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // --- Тестовые события ---
@@ -16,11 +25,27 @@ import (
 type UserCreatedEvent struct {
 	UserID string
 	Email  string
+	meta   map[string]string
+}
+
+func (e *UserCreatedEvent) Metadata() map[string]string {
+	if e.meta == nil {
+		e.meta = make(map[string]string)
+	}
+	return e.meta
 }
 
 type OrderPaidEvent struct {
 	OrderID string
 	Amount  float64
+	meta    map[string]string
+}
+
+func (e *OrderPaidEvent) Metadata() map[string]string {
+	if e.meta == nil {
+		e.meta = make(map[string]string)
+	}
+	return e.meta
 }
 
 // --- Тесты ---
@@ -33,17 +58,17 @@ func TestRegistry_Bus(t *testing.T) {
 
 	t.Run("получение шины в первый раз", func(t *testing.T) {
 		t.Parallel()
-		bus, err := Bus[UserCreatedEvent](registry, topic)
+		bus, err := Bus[*UserCreatedEvent](registry, topic)
 		require.NoError(t, err)
 		require.NotNil(t, bus)
 	})
 
 	t.Run("получение существующей шины", func(t *testing.T) {
 		t.Parallel()
-		bus1, err1 := Bus[UserCreatedEvent](registry, topic)
+		bus1, err1 := Bus[*UserCreatedEvent](registry, topic)
 		require.NoError(t, err1)
 
-		bus2, err2 := Bus[UserCreatedEvent](registry, topic)
+		bus2, err2 := Bus[*UserCreatedEvent](registry, topic)
 		require.NoError(t, err2)
 
 		assert.Same(t, bus1, bus2, "должен возвращаться один и тот же экземпляр шины")
@@ -51,10 +76,10 @@ func TestRegistry_Bus(t *testing.T) {
 
 	t.Run("ошибка при получении шины с другим типом для того же топика", func(t *testing.T) {
 		t.Parallel()
-		_, err := Bus[UserCreatedEvent](registry, "topic.conflict")
+		_, err := Bus[*UserCreatedEvent](registry, "topic.conflict")
 		require.NoError(t, err)
 
-		_, err = Bus[OrderPaidEvent](registry, "topic.conflict")
+		_, err = Bus[*OrderPaidEvent](registry, "topic.conflict")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "уже существует с другим типом события")
 	})
@@ -64,14 +89,14 @@ func TestBus_PublishSubscribe_Sync(t *testing.T) {
 	t.Parallel()
 
 	registry := NewRegistry()
-	bus, err := Bus[UserCreatedEvent](registry, "user.created.sync")
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.sync")
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	var receivedEvent UserCreatedEvent
-	handler := func(ctx context.Context, e UserCreatedEvent) error {
+	var receivedEvent *UserCreatedEvent
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
 		receivedEvent = e
 		wg.Done()
 		return nil
@@ -81,7 +106,7 @@ func TestBus_PublishSubscribe_Sync(t *testing.T) {
 	require.NoError(t, err)
 	defer unsubscribe()
 
-	event := UserCreatedEvent{UserID: "user-sync-123", Email: "sync@test.com"}
+	event := &UserCreatedEvent{UserID: "user-sync-123", Email: "sync@test.com"}
 	err = bus.Publish(context.Background(), event)
 	require.NoError(t, err)
 
@@ -93,25 +118,25 @@ func TestBus_PublishSubscribe_Async(t *testing.T) {
 	t.Parallel()
 
 	registry := NewRegistry()
-	bus, err := Bus[OrderPaidEvent](registry, "order.paid.async")
+	bus, err := Bus[*OrderPaidEvent](registry, "order.paid.async")
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	var receivedEvent OrderPaidEvent
-	handler := func(ctx context.Context, e OrderPaidEvent) error {
+	var receivedEvent *OrderPaidEvent
+	handler := func(ctx context.Context, e *OrderPaidEvent) error {
 		time.Sleep(10 * time.Millisecond) // имитация работы
 		receivedEvent = e
 		wg.Done()
 		return nil
 	}
 
-	unsubscribe, err := bus.Subscribe(handler, WithAsync[OrderPaidEvent]())
+	unsubscribe, err := bus.Subscribe(handler, WithAsync[*OrderPaidEvent]())
 	require.NoError(t, err)
 	defer unsubscribe()
 
-	event := OrderPaidEvent{OrderID: "order-async-456", Amount: 99.99}
+	event := &OrderPaidEvent{OrderID: "order-async-456", Amount: 99.99}
 	err = bus.Publish(context.Background(), event)
 	require.NoError(t, err)
 
@@ -123,26 +148,26 @@ func TestBus_Middleware(t *testing.T) {
 	t.Parallel()
 
 	registry := NewRegistry()
-	bus, err := Bus[UserCreatedEvent](registry, "user.created.middleware")
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.middleware")
 	require.NoError(t, err)
 
 	var middleware1Called, middleware2Called, handlerCalled bool
 
-	mw1 := func(next EventHandler[UserCreatedEvent]) EventHandler[UserCreatedEvent] {
-		return func(ctx context.Context, e UserCreatedEvent) error {
+	mw1 := func(next EventHandler[*UserCreatedEvent]) EventHandler[*UserCreatedEvent] {
+		return func(ctx context.Context, e *UserCreatedEvent) error {
 			middleware1Called = true
 			return next(ctx, e)
 		}
 	}
 
-	mw2 := func(next EventHandler[UserCreatedEvent]) EventHandler[UserCreatedEvent] {
-		return func(ctx context.Context, e UserCreatedEvent) error {
+	mw2 := func(next EventHandler[*UserCreatedEvent]) EventHandler[*UserCreatedEvent] {
+		return func(ctx context.Context, e *UserCreatedEvent) error {
 			middleware2Called = true
 			return next(ctx, e)
 		}
 	}
 
-	handler := func(ctx context.Context, e UserCreatedEvent) error {
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
 		handlerCalled = true
 		return nil
 	}
@@ -151,7 +176,7 @@ func TestBus_Middleware(t *testing.T) {
 	require.NoError(t, err)
 	defer unsubscribe()
 
-	err = bus.Publish(context.Background(), UserCreatedEvent{})
+	err = bus.Publish(context.Background(), &UserCreatedEvent{})
 	require.NoError(t, err)
 
 	// Даем время на выполнение в случае асинхронности (хотя здесь синхронно)
@@ -166,7 +191,7 @@ func TestBus_ErrorHandler(t *testing.T) {
 	t.Parallel()
 
 	registry := NewRegistry()
-	bus, err := Bus[UserCreatedEvent](registry, "user.created.error")
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.error")
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -174,14 +199,14 @@ func TestBus_ErrorHandler(t *testing.T) {
 
 	handlerErr := fmt.Errorf("ошибка в обработчике")
 	var receivedErr error
-	var receivedEvent UserCreatedEvent
+	var receivedEvent *UserCreatedEvent
 
-	handler := func(ctx context.Context, e UserCreatedEvent) error {
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
 		wg.Done()
 		return handlerErr
 	}
 
-	errorHandler := func(err error, e UserCreatedEvent) {
+	errorHandler := func(err error, e *UserCreatedEvent) {
 		receivedErr = err
 		receivedEvent = e
 		wg.Done()
@@ -191,7 +216,7 @@ func TestBus_ErrorHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer unsubscribe()
 
-	event := UserCreatedEvent{UserID: "user-error-789"}
+	event := &UserCreatedEvent{UserID: "user-error-789"}
 	err = bus.Publish(context.Background(), event)
 	require.NoError(t, err)
 
@@ -205,9 +230,9 @@ func TestRegistry_Shutdown(t *testing.T) {
 	t.Parallel()
 
 	registry := NewRegistry()
-	_, err := Bus[UserCreatedEvent](registry, "shutdown.test.1")
+	_, err := Bus[*UserCreatedEvent](registry, "shutdown.test.1")
 	require.NoError(t, err)
-	_, err = Bus[OrderPaidEvent](registry, "shutdown.test.2")
+	_, err = Bus[*OrderPaidEvent](registry, "shutdown.test.2")
 	require.NoError(t, err)
 
 	err = registry.Shutdown(context.Background())
@@ -216,9 +241,210 @@ func TestRegistry_Shutdown(t *testing.T) {
 	// Проверяем, что пул воркеров остановлен (косвенно)
 	// Попытка опубликовать событие после Shutdown не должна вызывать панику.
 	// В реальной системе провайдер мог бы возвращать ошибку.
-	bus, _ := Bus[UserCreatedEvent](registry, "shutdown.test.1")
-	err = bus.Publish(context.Background(), UserCreatedEvent{})
+	bus, _ := Bus[*UserCreatedEvent](registry, "shutdown.test.1")
+	err = bus.Publish(context.Background(), &UserCreatedEvent{})
 	assert.NoError(t, err) // Наш noop-like shutdown не возвращает ошибок
+}
+
+// --- Тесты Observability ---
+
+func TestBus_WithLogging(t *testing.T) {
+	t.Parallel()
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuffer, nil))
+
+	registry := NewRegistry()
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.logging", WithLogger[*UserCreatedEvent](logger))
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
+		wg.Done()
+		return nil
+	}
+	_, err = bus.Subscribe(handler)
+	require.NoError(t, err)
+
+	event := &UserCreatedEvent{UserID: "user-log-123", Email: "log@test.com"}
+	err = bus.Publish(context.Background(), event)
+	require.NoError(t, err)
+
+	wg.Wait()
+
+	logOutput := logBuffer.String()
+	assert.Contains(t, logOutput, `"msg":"публикация события"`)
+	assert.Contains(t, logOutput, `"event_type":"UserCreatedEvent"`)
+	assert.Contains(t, logOutput, `"msg":"начало обработки события"`)
+	assert.Contains(t, logOutput, `"msg":"событие успешно обработано"`)
+	assert.Contains(t, logOutput, `"handler_name"`)
+}
+
+func TestBus_WithMetrics(t *testing.T) {
+	t.Parallel()
+
+	reader := metric.NewManualReader()
+	meterProvider := metric.NewMeterProvider(metric.WithReader(reader))
+
+	registry := NewRegistry()
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.metrics", WithMeterProvider[*UserCreatedEvent](meterProvider))
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
+		time.Sleep(5 * time.Millisecond)
+		wg.Done()
+		return nil
+	}
+	_, err = bus.Subscribe(handler)
+	require.NoError(t, err)
+
+	event := &UserCreatedEvent{UserID: "user-metrics-123"}
+	err = bus.Publish(context.Background(), event)
+	require.NoError(t, err)
+
+	wg.Wait()
+
+	var rm metricdata.ResourceMetrics
+	err = reader.Collect(context.Background(), &rm)
+	require.NoError(t, err)
+
+	require.Len(t, rm.ScopeMetrics, 1, "должна быть одна группа метрик")
+	scopeMetrics := rm.ScopeMetrics[0]
+	require.Len(t, scopeMetrics.Metrics, 3, "должно быть три метрики")
+
+	// Проверка счетчика публикации
+	publishCount := findMetric(t, scopeMetrics.Metrics, "messaging.publish.count")
+	sum := publishCount.Data.(metricdata.Sum[int64])
+	assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+	assert.True(t, hasAttribute(sum.DataPoints[0].Attributes, "event.type", "UserCreatedEvent"))
+	assert.True(t, hasAttribute(sum.DataPoints[0].Attributes, "status", "success"))
+
+	// Проверка счетчика обработки
+	consumeCount := findMetric(t, scopeMetrics.Metrics, "messaging.consume.count")
+	sum = consumeCount.Data.(metricdata.Sum[int64])
+	assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+	assert.True(t, hasAttribute(sum.DataPoints[0].Attributes, "event.type", "UserCreatedEvent"))
+	assert.True(t, hasAttribute(sum.DataPoints[0].Attributes, "status", "success"))
+
+	// Проверка гистограммы длительности
+	consumeDuration := findMetric(t, scopeMetrics.Metrics, "messaging.consume.duration")
+	hist := consumeDuration.Data.(metricdata.Histogram[float64])
+	assert.Equal(t, uint64(1), hist.DataPoints[0].Count)
+	assert.Greater(t, hist.DataPoints[0].Sum, 0.0)
+}
+
+func TestBus_WithTracing(t *testing.T) {
+	t.Parallel()
+
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := trace.NewTracerProvider(trace.WithSpanProcessor(spanRecorder))
+
+	registry := NewRegistry()
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.tracing", WithTracerProvider[*UserCreatedEvent](tracerProvider))
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
+		// Проверяем, что в обработчик пришел активный спан
+		span := oteltrace.SpanFromContext(ctx)
+		require.True(t, span.IsRecording())
+		wg.Done()
+		return nil
+	}
+	_, err = bus.Subscribe(handler)
+	require.NoError(t, err)
+
+	event := &UserCreatedEvent{UserID: "user-trace-123"}
+	err = bus.Publish(context.Background(), event)
+	require.NoError(t, err)
+
+	wg.Wait()
+
+	// Проверяем записанные спаны
+	spans := spanRecorder.Ended()
+	require.Len(t, spans, 2, "должно быть два спана: publish и process")
+
+	var producerSpan, consumerSpan trace.ReadOnlySpan
+	for _, s := range spans {
+		if s.SpanKind() == oteltrace.SpanKindProducer {
+			producerSpan = s
+		}
+		if s.SpanKind() == oteltrace.SpanKindConsumer {
+			consumerSpan = s
+		}
+	}
+
+	require.NotNil(t, producerSpan, "не найден спан Producer")
+	require.NotNil(t, consumerSpan, "не найден спан Consumer")
+
+	assert.Equal(t, "UserCreatedEvent publish", producerSpan.Name())
+	assert.Equal(t, "UserCreatedEvent process", consumerSpan.Name())
+	assert.Equal(t, producerSpan.SpanContext().TraceID(), consumerSpan.SpanContext().TraceID())
+	assert.Equal(t, producerSpan.SpanContext().SpanID(), consumerSpan.Parent().SpanID())
+}
+
+func TestBus_ContextPropagation(t *testing.T) {
+	t.Parallel()
+
+	type contextKey string
+	const testKey = contextKey("test-value")
+	const testValue = "propagated-successfully"
+
+	registry := NewRegistry()
+	bus, err := Bus[*UserCreatedEvent](registry, "user.created.context")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	var receivedValue string
+	handler := func(ctx context.Context, e *UserCreatedEvent) error {
+		if val, ok := ctx.Value(testKey).(string); ok {
+			receivedValue = val
+		}
+		wg.Done()
+		return nil
+	}
+
+	// Используем асинхронную подписку, чтобы убедиться, что контекст
+	// корректно передается между горутинами.
+	unsubscribe, err := bus.Subscribe(handler, WithAsync[*UserCreatedEvent]())
+	require.NoError(t, err)
+	defer unsubscribe()
+
+	ctx := context.WithValue(context.Background(), testKey, testValue)
+	event := &UserCreatedEvent{UserID: "user-ctx-123"}
+	err = bus.Publish(ctx, event)
+	require.NoError(t, err)
+
+	wg.Wait()
+
+	assert.Equal(t, testValue, receivedValue, "значение из контекста должно быть успешно передано в обработчик")
+}
+
+// --- Вспомогательные функции для тестов ---
+
+func findMetric(t *testing.T, metrics []metricdata.Metrics, name string) metricdata.Metrics {
+	t.Helper()
+	for _, m := range metrics {
+		if m.Name == name {
+			return m
+		}
+	}
+	require.Fail(t, "метрика не найдена", "имя метрики: %s", name)
+	return metricdata.Metrics{}
+}
+
+func hasAttribute(set attribute.Set, key, value string) bool {
+	val, ok := set.Value(attribute.Key(key))
+	return ok && val.AsString() == value
 }
 
 // --- Тесты производительности ---
@@ -266,7 +492,11 @@ func benchmarkPublish[T Event](b *testing.B, topic string, numSubscribers int, a
 
 	// Создаем одно событие для переиспользования во всех итерациях,
 	// чтобы избежать накладных расходов на аллокацию в цикле измерения.
-	var event T
+	var zero T
+	// Мы должны создать не-nil значение для типа T, который является указателем.
+	// reflect.New(reflect.TypeOf(zero).Elem()) создает указатель на новый нулевой объект.
+	// Например, если T это *UserCreatedEvent, это создаст нового &UserCreatedEvent{}.
+	event := reflect.New(reflect.TypeOf(zero).Elem()).Interface().(T)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -282,91 +512,18 @@ func benchmarkPublish[T Event](b *testing.B, topic string, numSubscribers int, a
 	}
 }
 
-func TestBus_WithProvider(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry()
-	topic := "test.with.provider"
-
-	// 1. Создаем mock-провайдер
-	mockProvider := &mockProvider[UserCreatedEvent]{
-		publishFunc: func(ctx context.Context, event UserCreatedEvent) error {
-			// Проверяем, что событие дошло до нашего мока
-			assert.Equal(t, "user-provider-123", event.UserID)
-			return nil
-		},
-		subscribeFunc: func(handler EventHandler[UserCreatedEvent], opts ...SubscribeOption[UserCreatedEvent]) (unsubscribe func(), err error) {
-			// Для этого теста нам не нужно реализовывать подписку в моке
-			return func() {}, nil
-		},
-	}
-
-	// 2. Получаем шину с опцией WithProvider
-	bus, err := Bus[UserCreatedEvent](registry, topic, WithProvider[UserCreatedEvent](mockProvider))
-	require.NoError(t, err)
-	require.NotNil(t, bus)
-
-	// 3. Публикуем событие
-	event := UserCreatedEvent{UserID: "user-provider-123", Email: "provider@test.com"}
-	err = bus.Publish(context.Background(), event)
-	require.NoError(t, err)
-
-	// 4. Проверяем, что метод Publish был вызван у мока
-	assert.True(t, mockProvider.publishCalled, "метод Publish у mock-провайдера должен быть вызван")
-}
-
-// --- Mock Provider ---
-
-// mockProvider - это mock-реализация интерфейса Provider для тестирования.
-type mockProvider[T Event] struct {
-	publishFunc     func(ctx context.Context, event T) error
-	subscribeFunc   any
-	shutdownFunc    func(ctx context.Context) error
-	publishCalled   bool
-	subscribeCalled bool
-	shutdownCalled  bool
-}
-
-func (m *mockProvider[T]) Publish(ctx context.Context, event T) error {
-	m.publishCalled = true
-	if m.publishFunc != nil {
-		return m.publishFunc(ctx, event)
-	}
-	return nil
-}
-
-func (m *mockProvider[T]) Subscribe(handler EventHandler[T], opts ...SubscribeOption[T]) (unsubscribe func(), err error) {
-	m.subscribeCalled = true
-	if m.subscribeFunc != nil {
-		// Используем приведение типа к конкретной функции, сохраненной в `any`.
-		// Это правильный способ работы с обобщенными типами в моках.
-		if fn, ok := m.subscribeFunc.(func(EventHandler[T], ...SubscribeOption[T]) (func(), error)); ok {
-			return fn(handler, opts...)
-		}
-	}
-	return func() {}, nil
-}
-
-func (m *mockProvider[T]) Shutdown(ctx context.Context) error {
-	m.shutdownCalled = true
-	if m.shutdownFunc != nil {
-		return m.shutdownFunc(ctx)
-	}
-	return nil
-}
-
 func BenchmarkPublish_Sync_OneSubscriber(b *testing.B) {
-	benchmarkPublish[UserCreatedEvent](b, "bench.sync.one", 1, false)
+	benchmarkPublish[*UserCreatedEvent](b, "bench.sync.one", 1, false)
 }
 
 func BenchmarkPublish_Sync_MultipleSubscribers(b *testing.B) {
-	benchmarkPublish[UserCreatedEvent](b, "bench.sync.multiple", 100, false)
+	benchmarkPublish[*UserCreatedEvent](b, "bench.sync.multiple", 100, false)
 }
 
 func BenchmarkPublish_Async_OneSubscriber(b *testing.B) {
-	benchmarkPublish[OrderPaidEvent](b, "bench.async.one", 1, true)
+	benchmarkPublish[*OrderPaidEvent](b, "bench.async.one", 1, true)
 }
 
 func BenchmarkPublish_Async_MultipleSubscribers(b *testing.B) {
-	benchmarkPublish[OrderPaidEvent](b, "bench.async.multiple", 100, true)
+	benchmarkPublish[*OrderPaidEvent](b, "bench.async.multiple", 100, true)
 }

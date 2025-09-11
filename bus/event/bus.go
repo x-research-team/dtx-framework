@@ -24,28 +24,43 @@ type IBus[T Event] interface {
 type busImpl[T Event] struct {
 	topic    string
 	provider Provider[T]
-	opts     busOptions[T]
+	cfg      *config[T]
 }
 
 // NewBus создает новый, строго типизированный экземпляр Bus для конкретного
 // типа события T и связанного с ним топика.
-func NewBus[T Event](topic string, provider Provider[T], opts ...BusOption[T]) (*busImpl[T], error) {
+func NewBus[T Event](topic string, opts ...Option[T]) (*busImpl[T], error) {
 	if topic == "" {
 		return nil, fmt.Errorf("topic не может быть пустым")
 	}
-	if provider == nil {
-		return nil, fmt.Errorf("provider не может быть nil")
+
+	cfg := &config[T]{}
+	for _, opt := range opts {
+		opt(cfg)
 	}
 
-	options := busOptions[T]{}
-	for _, opt := range opts {
-		opt(&options)
+	// В будущем здесь будет логика выбора провайдера на основе конфигурации.
+	// Пока что, для обратной совместимости и выполнения текущей задачи,
+	// мы создаем LocalProvider по умолчанию.
+	provider, err := NewLocalProvider(topic, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось создать локальный провайдер: %w", err)
 	}
+
+	// Применяем middleware. Сначала добавляем middleware по умолчанию, затем пользовательские.
+	// Это позволяет пользователю переопределить или дополнить стандартное поведение.
+	allMiddlewares := []BusMiddleware[T]{
+		NewLoggingMiddleware[T](cfg.logger),
+		NewMetricsMiddleware[T](cfg.meterProvider),
+		NewTracingMiddleware[T](cfg.tracerProvider, cfg.propagator),
+	}
+	allMiddlewares = append(allMiddlewares, cfg.middlewares...)
+	wrappedProvider := applyMiddlewares(provider, allMiddlewares...)
 
 	return &busImpl[T]{
 		topic:    topic,
-		provider: provider,
-		opts:     options,
+		provider: wrappedProvider,
+		cfg:      cfg,
 	}, nil
 }
 
@@ -64,21 +79,3 @@ func (b *busImpl[T]) Shutdown(ctx context.Context) error {
 	return b.provider.Shutdown(ctx)
 }
 
-// busOptions содержит конфигурацию для шины.
-type busOptions[T Event] struct {
-	// provider - это кастомная реализация провайдера для шины.
-	// Если не указан, будет использоваться провайдер по умолчанию.
-	provider Provider[T]
-}
-
-// BusOption - это функция для настройки Bus.
-type BusOption[T Event] func(*busOptions[T])
-
-// WithProvider - это опция для установки кастомного провайдера событий.
-// Позволяет заменить стандартную реализацию (например, LocalProvider)
-// на любую другую, совместимую с интерфейсом Provider.
-func WithProvider[T Event](p Provider[T]) BusOption[T] {
-	return func(o *busOptions[T]) {
-		o.provider = p
-	}
-}
