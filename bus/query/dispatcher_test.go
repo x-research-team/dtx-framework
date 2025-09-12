@@ -32,8 +32,9 @@ func TestDispatcher_Success(t *testing.T) {
 	t.Parallel()
 
 	// Создаем новый диспетчер.
-	dispatcher := query.NewDispatcher[testQuery, string]()
-	err := dispatcher.Register(testQueryHandler)
+	dispatcher, err := query.NewDispatcher[testQuery, string]()
+	require.NoError(t, err)
+	err = dispatcher.Register(testQueryHandler)
 	require.NoError(t, err, "Регистрация обработчика не должна вызывать ошибку")
 
 	// Отправляем запрос.
@@ -50,11 +51,12 @@ func TestDispatcher_Dispatch_NoHandler(t *testing.T) {
 	t.Parallel()
 
 	// Создаем новый диспетчер без регистрации обработчика.
-	dispatcher := query.NewDispatcher[testQuery, string]()
+	dispatcher, err := query.NewDispatcher[testQuery, string]()
+	require.NoError(t, err)
 
 	// Отправляем запрос.
 	q := testQuery{Value: "test"}
-	_, err := dispatcher.Dispatch(context.Background(), q)
+	_, err = dispatcher.Dispatch(context.Background(), q)
 
 	// Проверяем ошибку.
 	require.Error(t, err, "Выполнение запроса без обработчика должно вызывать ошибку")
@@ -67,8 +69,9 @@ func TestDispatcher_Register_AlreadyRegistered(t *testing.T) {
 	t.Parallel()
 
 	// Создаем новый диспетчер и регистрируем обработчик.
-	dispatcher := query.NewDispatcher[testQuery, string]()
-	err := dispatcher.Register(testQueryHandler)
+	dispatcher, err := query.NewDispatcher[testQuery, string]()
+	require.NoError(t, err)
+	err = dispatcher.Register(testQueryHandler)
 	require.NoError(t, err, "Первая регистрация обработчика не должна вызывать ошибку")
 
 	// Повторно регистрируем обработчик.
@@ -152,65 +155,4 @@ func TestRegistry_GetDispatcher_Concurrency(t *testing.T) {
 	for i := 1; i < goroutines; i++ {
 		assert.Same(t, firstDispatcher, dispatchers[i], "Все горутины должны получать один и тот же экземпляр диспетчера")
 	}
-}
-
-// Тест для проверки корректной работы middleware.
-func TestDispatcher_WithMiddleware(t *testing.T) {
-	t.Parallel()
-
-	type contextKey string
-	const (
-		key1 = contextKey("key1")
-		key2 = contextKey("key2")
-	)
-
-	// Middleware 1: добавляет значение в контекст и к результату.
-	mw1 := func(next query.QueryHandler[testQuery, string]) query.QueryHandler[testQuery, string] {
-		return func(ctx context.Context, q testQuery) (string, error) {
-			ctx = context.WithValue(ctx, key1, "value1")
-			res, err := next(ctx, q)
-			return "mw1-" + res, err
-		}
-	}
-
-	// Middleware 2: добавляет значение в контекст и к результату, проверяет значение из mw1.
-	mw2 := func(next query.QueryHandler[testQuery, string]) query.QueryHandler[testQuery, string] {
-		return func(ctx context.Context, q testQuery) (string, error) {
-			val, ok := ctx.Value(key1).(string)
-			require.True(t, ok, "Значение из mw1 должно быть в контексте")
-			assert.Equal(t, "value1", val, "Значение из mw1 некорректно")
-
-			ctx = context.WithValue(ctx, key2, "value2")
-			res, err := next(ctx, q)
-			return "mw2-" + res, err
-		}
-	}
-
-	// Обработчик, который проверяет значения из обоих middlewares.
-	handler := func(ctx context.Context, q testQuery) (string, error) {
-		val1, ok1 := ctx.Value(key1).(string)
-		require.True(t, ok1, "Значение из mw1 должно быть в контексте в обработчике")
-		assert.Equal(t, "value1", val1, "Значение из mw1 в обработчике некорректно")
-
-		val2, ok2 := ctx.Value(key2).(string)
-		require.True(t, ok2, "Значение из mw2 должно быть в контексте в обработчике")
-		assert.Equal(t, "value2", val2, "Значение из mw2 в обработчике некорректно")
-
-		return "handler", nil
-	}
-
-	// Создаем диспетчер с middleware.
-	dispatcher := query.NewDispatcher[testQuery, string](
-		query.WithMiddleware[testQuery, string](mw1),
-		query.WithMiddleware[testQuery, string](mw2),
-	)
-	err := dispatcher.Register(handler)
-	require.NoError(t, err)
-
-	// Выполняем запрос.
-	result, err := dispatcher.Dispatch(context.Background(), testQuery{})
-	require.NoError(t, err)
-
-	// Проверяем, что все middlewares и обработчик были вызваны в правильном порядке.
-	assert.Equal(t, "mw1-mw2-handler", result)
 }

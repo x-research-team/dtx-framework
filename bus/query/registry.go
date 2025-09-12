@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -49,8 +50,28 @@ func Dispatcher[Q Query[R], R any](r *Registry, queryName string, opts ...Option
 		return nil, fmt.Errorf("диспетчер для запроса '%s' уже существует с другим типом", queryName)
 	}
 
-	newDispatcher := NewDispatcher(opts...)
+	newDispatcher, err := NewDispatcher(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось создать новый диспетчер: %w", err)
+	}
 	r.dispatchers[queryName] = newDispatcher
 
 	return newDispatcher, nil
+}
+
+// Shutdown корректно завершает работу всех зарегистрированных диспетчеров.
+func (r *Registry) Shutdown(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for name, dispatcher := range r.dispatchers {
+		if d, ok := dispatcher.(interface{ Shutdown(context.Context) error }); ok {
+			if err := d.Shutdown(ctx); err != nil {
+				// В реальном приложении здесь должно быть логирование.
+				fmt.Printf("ошибка при завершении работы диспетчера '%s': %v\n", name, err)
+			}
+		}
+	}
+
+	return nil
 }
