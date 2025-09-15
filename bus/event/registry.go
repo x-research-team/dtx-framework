@@ -49,7 +49,7 @@ func Bus[T Event](r *Registry, topic string, opts ...Option[T]) (IBus[T], error)
 
 	// Теперь NewBus сам заботится о создании провайдера по умолчанию.
 	// Мы просто передаем ему все опции.
-	newBus, err := NewBus[T](topic, opts...)
+	newBus, err := NewBus(topic, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось создать шину для топика '%s': %w", topic, err)
 	}
